@@ -42,18 +42,19 @@ echo "Container runtime: ${CONTAINER_CMD:-none}"
 ARCH=$(uname -m)
 echo "Host architecture: $ARCH"
 
-# On an x86 host, confirm arm64 images actually run (QEMU/binfmt must be registered)
+# On an x86 host, check that arm64 images run (only with an emulator the host already has)
 if [ -n "$CONTAINER_CMD" ] && [ "$ARCH" = "x86_64" ]; then
   $CONTAINER_CMD run --rm --init --platform linux/arm64 mcr.microsoft.com/dotnet/runtime-deps:8.0 timeout 30 uname -m   # must print aarch64
 fi
 ```
 
-A `command -v` cascade can pick a runtime that cannot run anything: on the x86 host used to validate this skill, `finch` was on PATH but `finch info` failed. After a reboot of that host, before QEMU was registered again, the same container printed `[FATAL tini (6)] exec timeout failed: Exec format error` and the block exited 1: the runtime works but has no ARM64 support. Registering emulation is a privileged change to the host that lasts until the next reboot, so ask the user before doing it; until then, follow the x86 host + no container runtime case below.
+A `command -v` cascade can pick a runtime that cannot run anything: on the x86 host used to validate this skill, `finch` was on PATH but `finch info` failed. After a reboot of that host cleared QEMU's registration, the same container printed `[FATAL tini (6)] exec timeout failed: Exec format error` and the block exited 1: the runtime works but has no ARM64 support.
 
 **Decision logic:**
 - **ARM64 host (aarch64/arm64) + container runtime:** Publish, test and validate in containers using `$CONTAINER_CMD`. This is the ideal path.
 - **ARM64 host (aarch64/arm64) + no container runtime:** Validate directly on the host with an SDK of the right version (§3.0).
 - **x86 host + container runtime with ARM64 support:** Publish for linux-arm64 natively on the host and run the output with `--platform linux/arm64`. On x86 Linux this runs under QEMU emulation (see "Emulation limits" below).
+- **x86 host + container runtime that cannot run arm64 images:** as with no container runtime. Do not register an emulator, a privileged host change that is the user's decision.
 - **x86 host + no container runtime:** Static analysis and native publishes with output scans only (Phase 1, §3.1). Document that ARM64 runtime validation needs a Graviton host or the target, and recommend one.
 
 **Match the production hosts.** A Phase 3 check passes only on a Graviton host with the production OS and page size (Phase 1.1), or on the target itself, such as the arm64 Lambda function. A `linux/arm64` run under emulation or on another arm64 machine finds failures early, but its CPU and kernel differ from Graviton's: QEMU on an x86 host can report SVE with 512-bit vectors and SME, while Graviton2 has no SVE, Graviton3 has 256-bit SVE, Graviton4 and Graviton5 have 128-bit SVE and SVE2, and none has SME (measured on each); Apple's M1 to M3 cores have no SVE, and the M4 has SME without SVE ([LLVM's processor definitions](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AArch64/AArch64Processors.td)); and a container uses its host's kernel, so a host whose page size is smaller than production's (an x86 host has 4KB pages; on a Mac, run `getconf PAGESIZE` in its VM) does not show the failures of 64KB pages (a library aligned for 4KB pages failed on a 64KB-page AlmaLinux 8 host and loaded on a 4KB-page Graviton4 host; [nuget-native-assets.md](nuget-native-assets.md) §6). When the project ships native code it builds, run its tests on the oldest Graviton generation it deploys to: a newer generation does not show `Illegal instruction`. Record where each check ran, with the host's page size, in `06-build-test-results.md`.
@@ -62,7 +63,7 @@ A `command -v` cascade can pick a runtime that cannot run anything: on the x86 h
 
 Throughout Phase 3, replace `docker` with `$CONTAINER_CMD` in all commands. `CONTAINER_CMD` exists only in the shell that set it: if each command runs in a new shell, start a later block with `CONTAINER_CMD=<the detected runtime>`. `host_timeout` and `run_arm64` (below) are saved by their defining blocks to files under `${TMPDIR:-/tmp}`, and a later block that calls one loads it in its first line.
 
-**Emulation limits (x86 host).** Microsoft's supported-OS lists say "The QEMU emulator is not supported to run .NET apps" ([.NET 8](https://github.com/dotnet/core/blob/main/release-notes/8.0/supported-os.md)), so an emulated run is a smoke test, and the verdict for anything it cannot show comes from Graviton. Observed while validating this skill with Docker and QEMU registered through binfmt_misc:
+**Emulation limits (x86 host).** Microsoft's supported-OS lists say "The QEMU emulator is not supported to run .NET apps" ([.NET 8](https://github.com/dotnet/core/blob/main/release-notes/8.0/supported-os.md)), so an emulated run is a smoke test, and the verdict for anything it cannot show comes from Graviton. Observed with Docker and QEMU:
 
 - **Bound every container run, inside the container,** and remove the container afterwards (each `timeout` value in the blocks is an upper bound, so a stuck command fails instead of holding the session; raise it when a project needs longer):
   ```bash
@@ -229,7 +230,8 @@ rm -rf "${TMPDIR:-/tmp}/graviton-image-app"
 $CONTAINER_CMD cp "$cid":/app "${TMPDIR:-/tmp}/graviton-image-app"
 $CONTAINER_CMD rm -f "$cid" > /dev/null
 GV_CHECK="${TMPDIR:-/tmp}/dotnet_graviton_check.py"
-python3 "$GV_CHECK" scan "${TMPDIR:-/tmp}/graviton-image-app"   # the path the Dockerfile copies the application to
+GV_T=(); [ -z "${GV_ROOT:-}" ] || GV_T=(--target-root "$GV_ROOT")   # the base image's folder (Phase 1.1), when this shell has it
+python3 "$GV_CHECK" scan "${GV_T[@]}" "${TMPDIR:-/tmp}/graviton-image-app"   # the path the Dockerfile copies the application to
 # Must show: Architecture: arm64, RID: linux-arm64, and no FINDING
 ```
 
@@ -302,7 +304,7 @@ Verify:
 1. Application starts without errors on linux/arm64 (`RuntimeInformation.ProcessArchitecture` reports `Arm64`)
 2. Every native library the application uses loads (exercise the code paths that load them: a self-check command, health checks, the first requests)
 3. No immediate runtime crashes, `DllNotFoundException`, `PlatformNotSupportedException` or `TypeInitializationException`
-4. Where the application ships both architectures of a native file (an output-scan `NOTE`), the aarch64 one is the one loaded
+4. Where the output holds several builds of a native library (an output-scan `NOTE`), the build the `NOTE` names is the one loaded
 5. On EC2 targets that require IMDSv2 (Amazon Linux 2023 by default), the AWS SDK obtains instance-role credentials
 6. Lambda functions: deploy the arm64 function with the tool the project already uses (for example `dotnet lambda deploy-function` from Amazon.Lambda.Tools, or `sam deploy`) and invoke it
 

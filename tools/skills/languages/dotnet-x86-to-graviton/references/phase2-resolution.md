@@ -72,6 +72,7 @@ Update ONLY dependencies flagged as MUST UPGRADE in Phase 1.3. Do NOT upgrade co
 
 ```bash
 GV_CHECK="${TMPDIR:-/tmp}/dotnet_graviton_check.py"
+# The target of Phase 1.1: for a target image, --target-root FOLDER in place of --target-rid and --glibc
 python3 "$GV_CHECK" probe SkiaSharp.NativeAssets.Linux 2.80.0 --target-rid linux-arm64 --glibc 2.34; echo "exit status $?"
 ```
 
@@ -139,6 +140,7 @@ After the changes, keep the Phase 1 evidence that `03-dependency-compatibility-r
 cp graviton-validation/raw/native-assets.txt graviton-validation/raw/native-assets-phase1.txt
 cp graviton-validation/raw/dependency-tree.json graviton-validation/raw/dependency-tree-phase1.json
 GV_CHECK="${TMPDIR:-/tmp}/dotnet_graviton_check.py"
+# The options of the Phase 1.1 run (for a target image, --target-root FOLDER in place of --target-rid and --glibc)
 python3 "$GV_CHECK" assets --source-rid linux-x64 --target-rid linux-arm64 --glibc 2.34 \
   --tree graviton-validation/raw/dependency-tree.json > graviton-validation/raw/native-assets.txt; rc=$?
 cat graviton-validation/raw/native-assets.txt; echo "exit status $rc (0 no findings, 1 findings, 2 restore failed or wrote no project.assets.json)"

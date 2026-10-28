@@ -122,9 +122,11 @@ Projects no solution lists: <none | list>
 - **Policy applied:** `dotnet.framework_bump` = ask | approved=<tfm> | never; outcome: unchanged | <change and why>
 
 ## Target OS and libc
-- **Targets:** <image | AMI | Lambda runtime>, each with its libc and version, measured by <the Phase 1.1 or nuget-native-assets.md §6 block | the Lambda runtime table>
-- **Target RIDs:** <linux-arm64[, linux-musl-arm64]>; lowest glibc: <2.NN>; page size: <4KB | 64KB>
+- **Targets:** <image | AMI | Lambda runtime>, each with its OS (os-release name), C library and version, and highest `GLIBCXX_`, read from <the image's files (the nuget-native-assets.md §6 block) | the Lambda runtime table | `ldd --version` on the host>
+- **Target RIDs:** <linux-arm64[, linux-musl-arm64]>; lowest glibc: <2.NN>; check options of each run: <--target-root FOLDER | --glibc and --glibcxx>, --page-size
+- **Deployment hosts:** <host>: page size <4KB | 64KB | unknown>, kernel <release | unknown>, from <`getconf PAGESIZE` and `uname -r` there | `page=` and `kernel=` in `target.hosts` | the team that runs the hosts>
 - **Globalization:** <InvariantGlobalization, ICU and tzdata in the target images (windows-to-linux.md §5)>
+- **From skill-config:** <none | the `target.hosts` and `target.images` entries used, and each value a target's files or a host measurement overruled>
 
 ## Feeds
 <nuget.org | the sources and package source mapping in NuGet.config; versions missing from a feed: INFRA items>
@@ -359,7 +361,7 @@ Source RID: linux-x64 | win-x64. Target RIDs: <linux-arm64[, linux-musl-arm64]>.
 ### `raw/native-assets.txt`
 
 **Created:** Phase 1.1 (Generate Dependency Tree), re-run in Phase 2.2
-**Purpose:** The per-RID native report: `OK`, `FINDING`, `CHECK` and `NOTE` lines with `via` chains, and the summary line. Kept for traceability; not hand-edited.
+**Purpose:** The per-RID native report: the target line, `OK`, `FINDING`, `CHECK` and `NOTE` lines with `via` chains, and the summary lines. Kept for traceability; not hand-edited.
 
 ---
 

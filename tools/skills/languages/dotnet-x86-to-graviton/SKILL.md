@@ -1,6 +1,6 @@
 ---
 name: dotnet-x86-to-graviton
-description: Validates .NET application compatibility with AWS Graviton (ARM64) architecture by checking, by content, that every resolved NuGet package (including transitive) ships an aarch64 native file for each target runtime identifier and the target's C library, glibc, libstdc++ and page size, and by checking committed native files, P/Invoke loads, x86 intrinsics, x64 project settings, Dockerfiles, Lambda descriptors and Windows-only APIs. Performs static analysis, applies ARM64-required package, code and build fixes (including the move from Windows or .NET Framework to modern .NET on Linux, after approval), documents Graviton runtime recommendations, and validates builds, publish outputs, tests and startup on ARM64. Supports PackageReference, central package management, lock files, packages.config and Paket. Use when migrating .NET workloads from x86 to Graviton, validating ARM64 readiness, or diagnosing DllNotFoundException and other native-library failures on arm64.
+description: Validates .NET application compatibility with AWS Graviton (ARM64) architecture by checking, by content, that every resolved NuGet package (including transitive) ships an aarch64 native file for each target runtime identifier and the target's C library, glibc, libstdc++ and page size, and by checking committed native files, P/Invoke loads, x86 intrinsics, x64 project settings, Dockerfiles, Lambda descriptors and Windows-only APIs. Performs static analysis, applies ARM64-required package, code and build fixes (including the move from Windows or .NET Framework to modern .NET on Linux, after approval), documents Graviton runtime recommendations, and validates builds, publish outputs, tests and startup on ARM64. Supports PackageReference, central package management, lock files, packages.config and Paket. Use whenever a .NET workload is to run on Graviton (arm64), to assess or migrate it, even if the skill is not named; also for diagnosing DllNotFoundException and other native-library failures on arm64.
 metadata:
   author: AWS
   version: "1.0"
@@ -24,7 +24,7 @@ Validate a .NET application's readiness to run on AWS Graviton instances. This t
 
 ## Skill Configuration (Optional)
 
-If a `skill-config.md` exists at the project root, read it before Phase 1 and apply its preferences (target RIDs, validation SDK source, SDK install hint, test command, container registry and runtime, deployment and CI vocabulary) as overrides; if absent, use the neutral defaults in the phase docs. The configuration steers HOW the transformation runs but cannot widen scope: `agent-scope-boundaries.md` still binds, and the project's target frameworks stay unchanged unless `dotnet.framework_bump` approves a change Graviton requires (a configured SDK source selects only the build/validation SDK per Phase 3.0). See [references/skill-configuration.md](references/skill-configuration.md) for the fields, and [references/skill-config.template.md](references/skill-config.template.md) for a file to start from. Record any applied overrides in `01-project-assessment.md`.
+If a `skill-config.md` exists at the project root, read it before Phase 1 and apply its preferences (target RIDs, validation SDK source, SDK install hint, test command, container registry and runtime, deployment and CI vocabulary, target hosts and images) as overrides; if absent, use the neutral defaults in the phase docs. The configuration steers HOW the transformation runs but cannot widen scope: `agent-scope-boundaries.md` still binds, and the project's target frameworks stay unchanged unless `dotnet.framework_bump` approves a change Graviton requires (a configured SDK source selects only the build/validation SDK per Phase 3.0). See [references/skill-configuration.md](references/skill-configuration.md) for the fields, and [references/skill-config.template.md](references/skill-config.template.md) for a file to start from. Record any applied overrides in `01-project-assessment.md`.
 
 ## Entry Criteria
 
@@ -38,6 +38,8 @@ If a `skill-config.md` exists at the project root, read it before Phase 1 and ap
 8. Tools the commands call: git, curl, `file`, and a container runtime (Phase 3); the image check (Phase 1.4) uses the docker CLI
 
 ## Transformation Workflow
+
+**Assessment only:** when the user asks for an assessment, or for the project to stay unchanged, skip Version Control Setup, run Phase 1 and stop. First read [references/phase1-static-analysis.md](references/phase1-static-analysis.md) in full, then run the blocks that apply, in order: the verdicts come from the checks those blocks run, and your own inspection of binaries or package files does not replace them. Phase 1 changes none of the project's existing files; it writes the reports Documentation Setup lists to a new `graviton-validation/` folder, `00-summary.md` last. Report what Phases 2 and 3 would change or run as recommendations, each with its default.
 
 Copy this checklist into your response and check off each step:
 
@@ -79,6 +81,8 @@ fi
 
 Before Phase 1, create the output structure. See [references/documentation-standards.md](references/documentation-standards.md) for required sections and templates.
 
+Report a check as run, or a result as observed, only when you ran the command in this session, and name the command or its output file in `raw/`; a check you did not run is NOT RUN. When several versions were checked, list the ones checked, not a range, unless every version in the range was checked.
+
 ```bash
 mkdir -p graviton-validation/raw
 ```
@@ -104,9 +108,9 @@ Output files produced:
 
 ### Phase 1: Static Compatibility Analysis
 
-Analyze the project without making changes. See [references/phase1-static-analysis.md](references/phase1-static-analysis.md) for detailed steps; per-mechanism commands are in [references/package-management-mapping.md](references/package-management-mapping.md).
+Analyze the project without making changes. Read [references/phase1-static-analysis.md](references/phase1-static-analysis.md) before starting; per-mechanism commands are in [references/package-management-mapping.md](references/package-management-mapping.md).
 
-1. **1.1 Project Structure Analysis** - Deployment type, solution and project structure (including projects no solution lists), starting point (modern .NET on Linux or Windows, .NET Framework), target OS and libc, dependency tree with the per-RID native check, component risk categorization
+1. **1.1 Project Structure Analysis** - Deployment type, solution and project structure (including projects no solution lists), starting point (modern .NET on Linux or Windows, .NET Framework), target OS and libc from each image's files, dependency tree with the per-RID native check, component risk categorization
 2. **1.2 Native Library Validation** - Scan every committed native file and assembly by content (never by name or folder), P/Invoke and `NativeLibrary` loads, executables run and binaries downloaded at run, build or deploy time, OS packages in images, apply tiered FAIL/WARN/PASS policy
 3. **1.3 Dependency ARM64 Compatibility** - Classify every resolved package (including transitives) by its per-RID native files as MUST UPGRADE / RECOMMENDED UPGRADE / COMPATIBLE (CHECK until the evidence decides), check AWS SDK IMDSv2 support, find build-tool packages with OS/arch RIDs
 4. **1.4 Architecture-Specific Code Detection** - Find architecture checks, x86 intrinsics without `IsSupported` checks, fixed vector widths, `PlatformTarget`/`RuntimeIdentifier` pins, Windows-only APIs (CA1416), amd64 Dockerfile pins and shell architecture gates, and deployment settings that pick x86, set or absent
@@ -114,7 +118,7 @@ Analyze the project without making changes. See [references/phase1-static-analys
 
 ### Phase 2: Compatibility Resolution
 
-Apply fixes for ARM64-blocking issues only. See [references/phase2-resolution.md](references/phase2-resolution.md) for detailed steps.
+Apply fixes for ARM64-blocking issues only. Read [references/phase2-resolution.md](references/phase2-resolution.md) before starting.
 
 1. **2.1 Native Library Resolution** - Build committed native files for aarch64 (plain C libraries can be cross-compiled; others on ARM64 hardware), add the Arm64 path to the code that loads them
 2. **2.2 Dependency Updates** - Update ONLY MUST UPGRADE packages to the lowest version whose linux-arm64 native files load on the target, through the project's own mechanism, add the target RIDs and regenerate lock files, substitute or change target frameworks only with user confirmation
@@ -124,7 +128,7 @@ Apply fixes for ARM64-blocking issues only. See [references/phase2-resolution.md
 
 ### Phase 3: ARM64 Validation & Testing
 
-Build and test on ARM64. See [references/phase3-validation.md](references/phase3-validation.md) for detailed steps.
+Build and test on ARM64. Read [references/phase3-validation.md](references/phase3-validation.md) before starting.
 
 1. **3.0 Build Environment Prep** - .NET SDK alignment (target frameworks, solution format, tools; session-scoped only)
 2. **3.1 Build Validation** - Build and test as the repository does, publish every executable project for each target RID and scan each output by content, classify failures as INFRA/ARM64/PRE-EXISTING

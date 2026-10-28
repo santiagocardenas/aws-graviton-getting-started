@@ -149,17 +149,19 @@ grep -rnE "${EX[@]}" --include='*.y*ml' --include='*.json' --include='*.template
 ```
 
 Then, for each target:
-- **Container images:** read the image's libc, and for a glibc image its libstdc++ version, with the blocks in [nuget-native-assets.md §6](nuget-native-assets.md#6-target-os-libc-glibc-version-page-size), which also list the results for the common .NET and Lambda images.
-- **Lambda managed runtimes:** `dotnet8` and `dotnet10` run on Amazon Linux 2023 (glibc 2.34); `dotnet6` and `dotnetcore3.1` ran on Amazon Linux 2 (glibc 2.26) ([Lambda runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)).
+- **Container images:** copy each image's files with the block in [nuget-native-assets.md §6](nuget-native-assets.md#6-target-os-libc-glibc-version-page-size) and pass the folder with `--target-root`: the check reads the C library (and so the target RID), the glibc versions and the libstdc++ level from it.
+- **Lambda managed runtimes:** the runtime identifier sets the OS, as the runtimes table shows ([Lambda runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)): Amazon Linux 2023 has glibc 2.34, Amazon Linux 2 glibc 2.26. AWS publishes a base image for each runtime, listed with its OS ([AWS base images for .NET](https://docs.aws.amazon.com/lambda/latest/dg/csharp-image.html)): read the one for the function's runtime as for a container image; if it cannot be read, pass `--glibc` with that OS's version and leave `--glibcxx` out.
 - **EC2 hosts:** ask for the AMI if no file names it. Amazon Linux 2023 AMIs launch in IMDSv2-only mode by default ([Deprecated in AL2023](https://docs.aws.amazon.com/linux/al2023/ug/deprecated-al2023.html)); §1.3 uses this for the AWS SDK.
 
-Record four values for the rest of the skill:
+Record for the rest of the skill:
 - the **target RIDs**: `linux-arm64`, plus `linux-musl-arm64` when any target image is Alpine;
-- the **lowest glibc version** across the targets;
-- the **lowest libstdc++ version** (`GLIBCXX_3.4.N`) across the glibc targets, when it can be read for each of them (from an image, with the block in §6; a Lambda managed runtime has no image to read it from);
+- for each target image, the **folder of its files** (`--target-root`; one run of the check per folder);
+- for the targets with no image, the **lowest glibc version** (`--glibc`);
 - the **page size** when a target kernel uses 64KB pages (AlmaLinux 8 and Rocky Linux 8 aarch64).
 
-For a Lambda function on a managed .NET runtime, the arm64 target is `dotnet8` or `dotnet10` (§1.5), so the lowest glibc is 2.34; the managed runtime's libstdc++ version cannot be read, so `--glibcxx` is left out. When no file names the target OS, as for an EC2 host whose AMI no file names, ask.
+For a Lambda function on a managed .NET runtime, read its runtime's base image as the Lambda bullet above says. When no file names the target OS, as for an EC2 host whose AMI no file names, ask.
+
+> **Skill config:** `target.hosts` and `target.images` in `skill-config.md` add targets to the ones the repository names; a host's `page=` and `kernel=` count only when they were not measured there. The C library and its versions still come from each target's files.
 
 ### Generate Dependency Tree
 
@@ -170,8 +172,8 @@ One scratch restore gives both the dependency tree (every resolved package with 
 ```bash
 GV_CHECK="${TMPDIR:-/tmp}/dotnet_graviton_check.py"
 mkdir -p graviton-validation/raw
-# --source-rid: linux-x64 for a Linux starting point, win-x64 for Windows. --glibc: the target's version (Determine Target OS and libc);
-# add --glibcxx and --page-size when those values were recorded there.
+# --source-rid: linux-x64 for a Linux starting point, win-x64 for Windows. For a target image, --target-root FOLDER
+# (Determine Target OS and libc) in place of --target-rid and --glibc; add --page-size when it was recorded there.
 python3 "$GV_CHECK" assets --source-rid linux-x64 --target-rid linux-arm64 --glibc 2.34 \
   --tree graviton-validation/raw/dependency-tree.json > graviton-validation/raw/native-assets.txt; rc=$?
 cat graviton-validation/raw/native-assets.txt; echo "exit status $rc (0 no findings, 1 findings, 2 restore failed or wrote no project.assets.json)"
@@ -204,10 +206,10 @@ The per-RID report from §1.1 covers the first two. This section reads it, scans
 
 Statically bundled native code sits in two places. Judge both by content, never by name: a Linux library can be named `SQLite.Interop.dll`, and an executable has no extension.
 
-1. **NuGet packages.** Read `graviton-validation/raw/native-assets.txt` from §1.1. Each package with native files for the source or target RIDs gets one line per target RID and file:
-   - `OK`: an aarch64 build for the target's libc, with the GLIBC_ and GLIBCXX_ versions it needs, its LOAD alignment and the libraries it needs;
-   - `FINDING`: no file for the target RID, or a file that is x86-64, an Android build, built for the other libc, too new for the target's glibc or libstdc++, linked for a smaller page size than the target's, or a Windows or macOS binary;
-   - `CHECK`: x86-only files outside `runtimes/`, which fail only if a build target copies them or a tool runs them;
+1. **NuGet packages.** Read `graviton-validation/raw/native-assets.txt` from §1.1. Its first line names the target; each package with native files for the source or target RIDs then gets one line per target RID and file:
+   - `OK`: an aarch64 build the target's loader accepts;
+   - `FINDING`: no file for the target RID, or one the target's loader refuses;
+   - `CHECK`: a file that only a build step, a tool or a load in the target image settles;
    - an indented `via` line under each `FINDING` and `CHECK`, with the reference chain from a project.
 
    What each line means, and the package shapes behind them: [nuget-native-assets.md §3 and §4](nuget-native-assets.md#3-the-per-rid-check).
@@ -609,16 +611,9 @@ for r in json.load(sys.stdin)["releases-index"]:
    - .NET 10 needs glibc 2.27, which Amazon Linux 2 (glibc 2.26) does not have; .NET 8 needs glibc 2.23. On Graviton4, in an `amazonlinux:2` container, .NET 8.0.31 ran a console app and .NET 10.0.12 stopped at ``Failed to load .../libcoreclr.so, error: /lib64/libm.so.6: version `GLIBC_2.27' not found``; .NET 10.0.12 ran on AlmaLinux 8 (glibc 2.28).
    - The .NET Framework does not support Linux, and Windows is not supported on Graviton.
 3. **Support:** the block above prints each release's type (`lts` or `sts`), support phase and end of support from Microsoft's release index. Use the newest `lts` release in `active` support for new Graviton workloads, or an earlier release in `active` or `maintenance` support when the project needs it; a release in `eol` is out of support.
-4. **Lambda:** changing a function's architecture means uploading new code built for it ([Lambda architectures](https://docs.aws.amazon.com/lambda/latest/dg/foundation-arch.html)). After a runtime's block-update date, "Lambda begins blocking the update of code and configuration for existing functions", but "You can still upgrade the function configuration to a supported runtime" ([Lambda runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)):
+4. **Lambda:** changing a function's architecture means uploading new code built for it ([Lambda architectures](https://docs.aws.amazon.com/lambda/latest/dg/foundation-arch.html)). After a runtime's block-update date, "Lambda begins blocking the update of code and configuration for existing functions", but "You can still upgrade the function configuration to a supported runtime" ([Lambda runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)). Read the function's runtime in that table (its OS and its deprecation, block-create and block-update dates) when you assess it: a runtime past its block-update date cannot move to arm64 as it is, and must move too (MUST UPGRADE).
 
-   | Runtime | OS | Deprecation | Block create | Block update |
-   |---|---|---|---|---|
-   | `dotnet10` | Amazon Linux 2023 | Nov 14, 2028 | Dec 14, 2028 | Jan 15, 2029 |
-   | `dotnet8` | Amazon Linux 2023 | Nov 10, 2026 | Jul 29, 2027 | Aug 31, 2027 |
-   | `dotnet6` | Amazon Linux 2 | Dec 20, 2024 | Jul 29, 2027 | Aug 31, 2027 |
-   | `dotnetcore3.1` | Amazon Linux 2 | Apr 3, 2023 | Apr 3, 2023 | May 3, 2023 |
-
-   So the Linux solution's `dotnetcore3.1` function cannot move to arm64 as it is: its runtime must move too (MUST UPGRADE). The Lambda API refused a new `dotnetcore3.1` function for both architectures: `The runtime parameter of dotnetcore3.1 is no longer supported for creating or updating AWS Lambda functions.`
+   For example, the Linux solution's `dotnetcore3.1` function cannot move to arm64 as it is. The Lambda API refused a new `dotnetcore3.1` function for both architectures: `The runtime parameter of dotnetcore3.1 is no longer supported for creating or updating AWS Lambda functions.`
 5. **DO NOT change** target frameworks or the SDK, except where the move to Graviton requires it:
    - a .NET Framework or `-windows` target framework: port to modern .NET on Linux (MUST UPGRADE);
    - a runtime that cannot run on arm64 as it is, such as Lambda `dotnetcore3.1`;
