@@ -138,9 +138,52 @@ $CONTAINER_CMD run --rm --init --platform linux/arm64 --entrypoint python3 "$IMG
 
 The probe asks the image's own `python3`, because `sh -c` with `ldd --version` and `pip debug` misreads common targets: it printed empty fields with exit code 0 for Alpine (its `ldd --version` prints no glibc version) and for images without `python3` or pip, and did not run in the Lambda base images or distroless, whose `ENTRYPOINT` receives the command as arguments. The limits are inside the container (`signal.alarm` in the probe, `timeout` in the fallback) because under emulation a host-side `timeout` does not reliably stop the container (Phase 3, "Emulation limits"). Record the libc as `TARGET_LIBC` and `TARGET_LIBC_VER` for §1.3: for `python:3.11-slim` the probe printed `libc=glibc 2.41`, so `TARGET_LIBC=glibc TARGET_LIBC_VER=2.41` (wheel-verification.md §7 lists other images).
 
+For the native-file scan in §1.2.1, for the same image, copy its loaders and libraries into a folder with this block, which never starts the container. The check reads the C library from that folder, and passes a file only when the image's glibc, libstdc++ and libgcc_s define every version it needs from them, as the image's loader does (Amazon Linux 2023 reports glibc 2.34, yet its `libc.so.6` defines `GLIBC_2.35` and its `libm.so.6` does not).
+
+> **Skill config:** `target.hosts` and `target.images` in `skill-config.md` add targets to the ones the repository names; a host's `page=` and `kernel=` count only when they were not measured there. The C library and its versions still come from each target's files.
+
+```bash
+IMG=python:3.11-slim   # the image the application runs on
+GV_CLI=${CONTAINER_CMD:-docker}   # the CLI that Phase 3's detection found, else Docker; Finch and nerdctl take these options, podman cp has no -L
+command -v timeout > /dev/null 2>&1 || timeout() { shift; "$@"; }   # no GNU timeout (macOS without coreutils): run without the host-side limit
+GV_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/graviton-target-root.XXXXXX")
+# The image's loaders and libraries, from a container that is created and never started (no emulation, and no
+# shell needed in the image); timeout 300 bounds the image pull that create does
+if cid=$(timeout 300 "$GV_CLI" create --platform linux/arm64 "$IMG" none); then
+  for f in /etc/os-release /usr/lib/os-release /lib/apk/db/installed; do
+    mkdir -p "$GV_ROOT${f%/*}" && "$GV_CLI" cp -L "$cid:$f" "$GV_ROOT$f" 2> /dev/null
+  done
+  for dir in /lib /lib64 /usr/lib /usr/lib64 /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+    mkdir -p "$GV_ROOT$dir"
+    for lib in ld-musl-aarch64.so.1 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 \
+        libresolv.so.2 libutil.so.1 libanl.so.1 libmvec.so.1 libnsl.so.1 libstdc++.so.6 libgcc_s.so.1; do
+      "$GV_CLI" cp -L "$cid:$dir/$lib" "$GV_ROOT$dir/$lib" 2> /dev/null
+    done
+  done
+  "$GV_CLI" rm "$cid" > /dev/null
+  os=$(sed -n 's/^PRETTY_NAME=//p' "$GV_ROOT/etc/os-release" "$GV_ROOT/usr/lib/os-release" 2> /dev/null | head -n 1 | tr -d '"')
+  c=$(find "$GV_ROOT" -name libc.so.6 -type f | head -n 1); x=$(find "$GV_ROOT" -name 'libstdc++.so.6' -type f | head -n 1)
+  if [ -e "$GV_ROOT/lib/ld-musl-aarch64.so.1" ]; then
+    m=$(awk '/^P:musl$/{f=1; next} f && /^V:/{print substr($0, 3); exit}' "$GV_ROOT/lib/apk/db/installed" 2> /dev/null)
+    libc="musl${m:+ $m}"; [ -e "$GV_ROOT/lib/ld-linux-aarch64.so.1" ] && libc="$libc, with a glibc loader"
+  else
+    v=$(grep -ao 'release version 2\.[0-9]*' "$c" 2> /dev/null | head -n 1 | cut -d' ' -f3); libc="glibc ${v:-(no libc.so.6 found)}"
+  fi
+  if [ -n "$x" ]; then
+    cxx=$(grep -ao 'GLIBCXX_3\.4\.[0-9][0-9]*' "$x" | sort -u -t. -k3,3n | tail -n 1); cxx=${cxx:-"libstdc++ with no GLIBCXX_ versions"}
+  else cxx="no libstdc++.so.6"; fi
+  echo "$IMG: ${os:-no os-release}; $libc; $cxx; files in $GV_ROOT"
+  # The later checks read this folder: in a new shell, set GV_ROOT to the folder printed here again. Remove the
+  # folder by that exact path (rm -rf "$GV_ROOT"), never by a wildcard, once the report is written.
+else rmdir "$GV_ROOT"; echo "$IMG: no arm64 container was created (no arm64 variant of the image, or the pull failed: see the error above)"; fi
+```
+
+Set `TARGET_ROOT` to the folder the block printed for the scans of §1.2.1 and Phase 3, where it replaces `TARGET_LIBC`, `TARGET_LIBC_VER` and `TARGET_GLIBCXX`; the wheel probes of §1.3 still use the first two.
+
 - **No `python3` in the base image** (the fallback line): the deployment installs Python in a later step (`apt-get install python3`, `dnf install python3.11`), so the interpreter and pip come from that package. The libc still comes from the base image; read the rest from the built image or the distribution's package before §1.3.
-- **Lambda functions deployed as .zip archives** have no image: the runtime identifier sets the OS. `python3.12` and later run on Amazon Linux 2023 (glibc 2.34), `python3.10` and `python3.11` on Amazon Linux 2 (glibc 2.26) ([Lambda Python runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-python.html)); wheel-verification.md §7 shows a `manylinux_2_28` layer that imports on `python3.12` and fails on `python3.11`. For container-image functions, run the block against the image.
+- **Lambda functions deployed as .zip archives:** the runtime identifier sets the OS, as the runtimes table shows ([Lambda runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)): Amazon Linux 2023 has glibc 2.34, Amazon Linux 2 glibc 2.26; wheel-verification.md §7 shows a `manylinux_2_28` layer that imports on `python3.12` and fails on `python3.11`. AWS publishes a base image for each runtime, listed with its OS ([AWS base images for Python](https://docs.aws.amazon.com/lambda/latest/dg/python-image.html)): read the one for the function's runtime as for a container image; if it cannot be read, set `TARGET_LIBC_VER` to that OS's version and leave `TARGET_GLIBCXX` unset. For container-image functions, run the block against the image.
 - **No arm64 variant of the base image:** both runs stop with `no matching manifest for linux/arm64 in the manifest list entries` (executed with `amazonlinux:2018.03`, whose manifest list has only `amd64`). That is a MUST UPGRADE finding, and the replacement image is a user decision ([agent-scope-boundaries.md](agent-scope-boundaries.md), OUT OF SCOPE).
+- **No emulator on an x86 host:** both runs fail with `Exec format error`. Do not register one; take the C library and its version from the copy-out block's summary line below.
 - **No container runtime:** use the table in wheel-verification.md §7 and say so. For host-based deployments read the AMI's distribution.
 - **Kernel page size of the deployment hosts.** A container uses its host's kernel, so the page size comes from the EC2 hosts or Kubernetes nodes, not from the image: a Debian 13 container on an AlmaLinux 8 Graviton2 host reported 65536. Run `getconf PAGESIZE` on a deployment host (executed on Graviton: AlmaLinux 8.10 65536; AlmaLinux 9.8 and Amazon Linux 2023 4096); if no host can be reached, ask the team that runs them and record the page size as unknown until then. Set `TARGET_PAGE_SIZE` to the value in bytes: the scan in §1.2.1 judges page alignment only when it is set. A 64KB-page target needs Phase 3 on a 64KB-page host: on AlmaLinux 8, polars 0.20.20 aborted with `<jemalloc>: Unsupported system page size`, as did every earlier release tested back to 0.15.1, while 0.20.21 and the later releases tested imported. On the 4KB AlmaLinux 9 host polars 0.15.1 imported, so a 4KB validation host hides the failure.
 
@@ -204,35 +247,217 @@ Native code reaches a Python deployment in three ways: **wheels** from the index
 
 ### 1.2.1 Statically Bundled .so Scanning
 
-Scan the project tree for every native file and judge it by its content (its first bytes and its headers), never by its name, extension or folder: an executable can have no extension, a file named `libfoo-aarch64.so` can hold x86-64 code, and a Lambda layer zip or a vendored `py3-none-any` wheel can carry binaries. The scan opens every file, the members of zip archives and the objects in static archives (`.a`). It skips installed environments (directories with `pyvenv.cfg` or `conda-meta`), whose packages are judged by wheel in §1.3 and scanned the same way in Phase 3.1. For each Linux (ELF) file it prints the architecture, the C library the file was built for (glibc, musl, Android's bionic, or none), the highest `GLIBC_` version it needs from glibc's own libraries, the highest `GLIBCXX_` version it needs from libstdc++, its page alignment and the libraries it needs (`needs`, its DT_NEEDED list); Mach-O and PE files are listed as macOS and Windows builds. It then judges each file for the target of §1.1 (`TARGET_LIBC`, `TARGET_LIBC_VER`, `TARGET_PAGE_SIZE`) and prints one `FINDING` line per problem. The scan only reads files, so no project code runs. It needs only Python 3.6 or later, so it also runs where `file` and `readelf` are missing:
+Scan the project tree for every native file and judge it by its content (its first bytes and its headers), never by its name, extension or folder: an executable can have no extension, a file named `libfoo-aarch64.so` can hold x86-64 code, and a Lambda layer zip or a vendored `py3-none-any` wheel can carry binaries. The scan opens every file, the members of zip archives and the objects in static archives (`.a`). It skips installed environments (directories with `pyvenv.cfg` or `conda-meta`), whose packages are judged by wheel in §1.3 and scanned the same way in Phase 3.1. For each Linux (ELF) file it prints the architecture, the C library the file was built for (glibc, musl, Android's bionic, or none), the highest `GLIBC_` version it needs from glibc's own libraries, the highest `GLIBCXX_` version it needs from libstdc++, its page alignment and the libraries it needs (`needs`, its DT_NEEDED list); Mach-O and PE files are listed as macOS and Windows builds. It then judges each file for the target of §1.1 (`TARGET_ROOT`, or `TARGET_LIBC` and `TARGET_LIBC_VER`, and `TARGET_PAGE_SIZE`): a `FINDING` line per problem, a `CHECK` line for what only a load in the target image settles, and `NOTE` lines. The scan only reads files, so no project code runs. It needs only Python 3.6 or later, so it also runs where `file` and `readelf` are missing:
 
 ```bash
 TARGET_LIBC=glibc; TARGET_LIBC_VER=2.41; TARGET_PAGE_SIZE=4096   # from §1.1 (Alpine: TARGET_LIBC=musl TARGET_LIBC_VER=1.2)
 # native_scan PATH...: every native file under PATH, found by its first bytes (not its name or extension),
 # including members of zip archives (Lambda layer zips, vendored wheels, eggs) and of static archives (.a).
 # Installed environments (directories with pyvenv.cfg or conda-meta) are skipped: Phase 3 scans them.
-# Each Linux file is judged for the target in TARGET_LIBC, TARGET_LIBC_VER, TARGET_PAGE_SIZE (§1.1) and,
-# when known, TARGET_GLIBCXX: one FINDING line per problem, and exit status 1 when there is one.
+# Each Linux file is judged for the target in TARGET_ROOT (the image's files, §1.1) or else TARGET_LIBC, TARGET_LIBC_VER
+# and, when known, TARGET_GLIBCXX, with TARGET_PAGE_SIZE: FINDING, CHECK and NOTE lines, then "findings: N, checks: M";
+# exit status 1 on a FINDING.
 native_scan() {
 TARGET_LIBC="${TARGET_LIBC-}" TARGET_LIBC_VER="${TARGET_LIBC_VER-}" TARGET_PAGE_SIZE="${TARGET_PAGE_SIZE-}" \
-  TARGET_GLIBCXX="${TARGET_GLIBCXX-}" python3 - "$@" <<'EOF'
-import collections, io, os, re, struct, sys, zipfile
+  TARGET_GLIBCXX="${TARGET_GLIBCXX-}" TARGET_ROOT="${TARGET_ROOT-}" python3 - "$@" <<'EOF'
+import collections, hashlib, io, os, re, struct, sys, zipfile
 ARCH = {3: "i386", 40: "arm", 62: "x86-64", 183: "aarch64", 243: "riscv"}
+OS_ABI = {1: "HP-UX", 2: "NetBSD", 6: "Solaris", 7: "AIX", 9: "FreeBSD", 12: "OpenBSD"}  # EI_OSABI of other systems
 GLIBC_LIBS = re.compile(r"(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libresolv\.so\.2"
-                        r"|libutil\.so\.1|libanl\.so\.1|ld-linux[-a-z0-9_.]*\.so\.[0-9]+)$")
-LIBC, VER = os.environ["TARGET_LIBC"], os.environ["TARGET_LIBC_VER"]
-CXX = os.environ["TARGET_GLIBCXX"].replace("GLIBCXX_", "")
+                        r"|libutil\.so\.1|libanl\.so\.1|libmvec\.so\.1|libnsl\.so\.1|ld-linux[-a-z0-9_.]*\.so\.[0-9]+)$")
+MUSL_SELF = ("c.", "pthread.", "rt.", "m.", "dl.", "util.", "xnet.")  # "lib" + these: names musl's loader answers itself
+# Architecture and C library parts of file names, removed to find the builds of one library
+NAME_PARTS = re.compile(r"[-_.](x86[-_]64|x86[-_]32|x64|x86|amd64|i[3-6]86|aarch[-_]?64|arm64|arm[-_]?32|armv[5-8][a-z]*|"
+                        r"armhf|armel|arm|ppc(le)?[-_]?64(le)?|ppc|s390x?|s390[-_]64|riscv[-_]?64|loongarch[-_]?64|"
+                        r"mips(64)?(el)?|musl|gnu|glibc)(?=[-_.]|$)", re.I)
+# A target image's files (--target-root): the folders its loader searches, and the libraries whose files say what the
+# image provides: glibc's libraries and loader (the first eleven), musl's loader, libstdc++ and libgcc_s
+ROOT_DIRS = ("lib", "lib64", "usr/lib", "usr/lib64", "lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu")
+ROOT_LIBS = ("libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libresolv.so.2", "libutil.so.1",
+             "libanl.so.1", "libmvec.so.1", "libnsl.so.1", "ld-linux-aarch64.so.1", "ld-musl-aarch64.so.1",
+             "libstdc++.so.6", "libgcc_s.so.1")
+
+def root_file(root, rel):
+    """The file rel names in root (a target image's files), following symbolic links as the image would, an absolute
+    link pointing into root; None when the image has no such file."""
+    parts, done, hops = [x for x in rel.split("/") if x not in ("", ".")], [], 0
+    while parts and hops < 40:
+        x = parts.pop(0)
+        if x == "..":
+            done = done[:-1]
+        elif os.path.islink(os.path.join(root, *(done + [x]))):
+            link, hops = os.readlink(os.path.join(root, *(done + [x]))), hops + 1
+            parts = [y for y in link.split("/") if y not in ("", ".")] + parts
+            done = [] if link.startswith("/") else done
+        else:
+            done.append(x)
+    p = os.path.join(root, *done)
+    return p if not parts and os.path.isfile(p) else None
+
+def root_defines(b):
+    """(e_machine, the version names an ELF library defines through DT_VERDEF, without its own name)."""
+    if len(b) < 64 or b[:4] != b"\x7fELF" or b[4] != 2 or b[5] != 1:
+        return 0, []
+    machine, phoff = struct.unpack_from("<H", b, 18)[0], struct.unpack_from("<Q", b, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", b, 54)
+    loads, tags = [], {}
+    for k in range(phnum):
+        o = phoff + k * phentsize
+        if o + 56 > len(b):
+            break
+        p_type = struct.unpack_from("<I", b, o)[0]
+        p_offset, p_vaddr, _paddr, p_filesz = struct.unpack_from("<QQQQ", b, o + 8)
+        if p_type == 1:
+            loads.append((p_vaddr, p_offset, p_filesz))
+        elif p_type == 2:
+            for q in range(p_offset, min(len(b), p_offset + p_filesz) - 15, 16):
+                tag, val = struct.unpack_from("<qQ", b, q)
+                if tag == 0:
+                    break
+                tags.setdefault(tag, val)
+
+    def off(va):
+        return next((va - v + o for v, o, sz in loads if v <= va < v + sz), None)
+    st, o, names = off(tags.get(5, -1)), off(tags.get(0x6FFFFFFC, -1)), []  # DT_STRTAB, DT_VERDEF
+    for _ in range(tags.get(0x6FFFFFFD, 0)):  # DT_VERDEFNUM
+        if o is None or st is None or o + 20 > len(b):
+            break
+        _v, flags, _x, cnt, _h, aux, nxt = struct.unpack_from("<HHHHIII", b, o)
+        if cnt and not flags & 1 and o + aux + 8 <= len(b):  # VER_FLG_BASE (1) marks the library's own name
+            n = st + struct.unpack_from("<I", b, o + aux)[0]
+            names.append(b[n:b.find(b"\0", n)].decode("latin-1"))
+        if not nxt:
+            break
+        o += nxt
+    return machine, names
+
+def read_root(root):
+    """What a target image's files say: its C library, glibc release, the versions each library of ROOT_LIBS in it
+    defines, whether a musl image also has a glibc loader (gcompat), its highest GLIBCXX_ version and its os-release
+    name. A string saying why when root cannot be judged."""
+    if not os.path.isdir(root):
+        return "no such folder: %s" % root
+    t = {"root": root, "libc": "", "release": "", "defs": {}, "os": "", "glibc_loader": False, "glibcxx": ""}
+    for rel in ("etc/os-release", "usr/lib/os-release"):
+        p = root_file(root, rel)
+        if p:
+            with open(p, errors="replace") as f:
+                m = re.search(r'^PRETTY_NAME="?([^"\n]*)', f.read(), re.M)
+            t["os"] = m.group(1) if m else ""
+            break
+    machines = set()
+    for name in ROOT_LIBS:
+        p = next((x for x in (root_file(root, d + "/" + name) for d in ROOT_DIRS) if x), None)
+        if p:
+            with open(p, "rb") as f:
+                b = f.read()
+            machine, t["defs"][name] = root_defines(b)
+            machines.add(machine)
+            m = re.search(rb"release version ([0-9]+\.[0-9]+)", b) if name == "libc.so.6" else None
+            t["release"] = m.group(1).decode() if m else t["release"]
+    if "ld-musl-aarch64.so.1" in t["defs"]:
+        t["libc"], t["glibc_loader"] = "musl", "ld-linux-aarch64.so.1" in t["defs"]
+    elif "libc.so.6" in t["defs"]:
+        t["libc"] = "glibc"
+    else:
+        return ("%s has neither glibc's libc.so.6 nor musl's ld-musl-aarch64.so.1 in %s: copy the target image's "
+                "files there first" % (root, ", ".join(ROOT_DIRS)))
+    if machines - {183}:
+        return "the libraries in %s are not aarch64 (e_machine %s): copy them from the image for linux/arm64" % (
+            root, ", ".join(str(x) for x in sorted(machines - {183})))
+    cxx = [v[8:] for v in t["defs"].get("libstdc++.so.6", []) if re.match(r"^GLIBCXX_[0-9]+(\.[0-9]+)*$", v)]
+    t["glibcxx"] = max(cxx, key=lambda v: tuple(int(x) for x in v.split("."))) if cxx else ""
+    return t
+
+def root_needs(vers, t):
+    """Findings for the versions a glibc file needs ((library, version) pairs) that the image's copy of that library
+    does not define, the check glibc's loader makes: one per library and version prefix, naming the highest one
+    missing. A version needed from one of glibc's libraries that the image lacks is compared with its glibc release."""
+    def num(s):
+        return tuple(int(x) for x in s.split("."))
+    p = []
+    for lib in sorted(set(x for x, _ in vers)):
+        have = t["defs"].get(lib)
+        if have is None:
+            v = [n[6:] for x, n in vers if x == lib and lib in ROOT_LIBS[:11] and re.match(r"^GLIBC_[0-9]+(\.[0-9]+)*$", n)]
+            if v and t["release"] and num(max(v, key=num)) > num(t["release"]):
+                p.append("needs GLIBC_%s from %s; the image has no %s, and its glibc is %s" % (
+                    max(v, key=num), lib, lib, t["release"]))
+            continue
+        top = {}
+        for n in sorted(set(n for x, n in vers if x == lib and n not in have)):
+            m = re.match(r"^(.*?_)([0-9]+(\.[0-9]+)*)$", n)
+            k = m.group(1) if m else n
+            if k not in top or m and num(m.group(2)) > num(top[k][len(k):]):
+                top[k] = n
+        for k, n in sorted(top.items()):
+            known = [d[len(k):] for d in have if k != n and d.startswith(k) and re.match(r"^[0-9]+(\.[0-9]+)*$", d[len(k):])]
+            p.append("needs %s from %s; the target's %s %s" % (n, lib, lib, "defines up to %s%s" % (
+                k, max(known, key=num)) if known else "does not define it"))
+    return p
+
+def root_has(t, names):
+    """The names (libraries, or "interpreter <path>") that the target image's files provide; none without a root."""
+    if not t:
+        return []
+    return [n for n in names if (root_file(t["root"], n[12:]) if n.startswith("interpreter ") else
+                                 any(root_file(t["root"], d + "/" + n) for d in ROOT_DIRS))]
+
+def musl_check(own, image, other=()):
+    """The CHECK for a glibc build on a musl target when neither musl's loader nor the image refuses it. other: the
+    build's other libraries, which the target image must provide (SkiaSharp 2.88.6: libfontconfig.so.1)."""
+    only = "" if other else "only "
+    also = "; it also needs %s, which the target image must provide" % ", ".join(other) if other else ""
+    if not image:
+        return ("glibc build that needs %slibraries musl's loader provides (%s)%s; confirm by loading it in the "
+                "target image" % (only, ", ".join(own), also))
+    by_loader = [n for n in own if n not in image]
+    return "glibc build that needs %s%sfiles the target image has (%s)%s; confirm by loading it in the target image" % (
+        only, "libraries musl's loader provides (%s) and " % ", ".join(by_loader) if by_loader else "", ", ".join(image),
+        also)
+
+def root_shared(probs, x86_vers):
+    """The version of a per-library finding (probs) that the x86-64 build needs from the same library too."""
+    for p in probs:
+        m = re.match(r"^needs (\S+) from (\S+);", p)
+        if m and (m.group(2), m.group(1)) in x86_vers:
+            return m.group(1)
+    return ""
+
+def root_read_from(t):
+    """The end of the target line when the target was read from an image's files."""
+    return (", read from %s%s" % (t["root"], " (%s)" % t["os"] if t["os"] else "")) if t else ""
+
+# TARGET_ROOT: the image's files give the C library and its versions, and TARGET_LIBC, TARGET_LIBC_VER and
+# TARGET_GLIBCXX (which the wheel probes use) are not used by the scan
+ROOT, IGNORED = None, [v for v in ("TARGET_LIBC", "TARGET_LIBC_VER", "TARGET_GLIBCXX") if os.environ[v]]
+if os.environ["TARGET_ROOT"]:
+    ROOT = read_root(os.environ["TARGET_ROOT"])
+    if not isinstance(ROOT, dict):
+        print("ERROR: " + ROOT)
+        sys.exit(2)
+ASSUMED = not (os.environ["TARGET_LIBC"] or ROOT)  # no target given: judge against glibc and say so
+LIBC = ROOT["libc"] if ROOT else os.environ["TARGET_LIBC"] or "glibc"
+VER = "" if ROOT else os.environ["TARGET_LIBC_VER"]
+REL = VER or (ROOT["release"] if ROOT else "")  # the glibc release, for the page-alignment rule
+if LIBC not in ("glibc", "musl"):
+    print("ERROR: TARGET_LIBC is glibc or musl")
+    sys.exit(2)
+CXX = "" if ROOT else os.environ["TARGET_GLIBCXX"].replace("GLIBCXX_", "")
 if not re.match(r"[0-9]*$", os.environ["TARGET_PAGE_SIZE"]):
-    sys.exit("TARGET_PAGE_SIZE is a number of bytes, for example 65536")
+    print("ERROR: TARGET_PAGE_SIZE is a number of bytes, for example 65536")
+    sys.exit(2)
 PAGE = int(os.environ["TARGET_PAGE_SIZE"] or 0)
-lines, findings, machines = [], [], collections.Counter()
+entries, machines = [], collections.Counter()
 
 def vkey(v):
     return tuple(int(x) for x in re.findall(r"[0-9]+", v))
 
-def report(name, desc, problems=()):
-    lines.append("%s: %s" % (name, desc))
-    findings.extend("%s: %s" % (name, p) for p in problems)
+def add(name, box, desc, **kw):  # box: the archive that holds the file, or the path given for loose files
+    e = {"name": name, "box": box, "desc": desc, "probs": [], "checks": [], "loadable": False, "small": False}
+    e.update(kw)
+    entries.append(e)
+    return e
 
 def reader(src):  # read(offset, size) on bytes or on an open file, never past its end
     if isinstance(src, bytes):
@@ -245,18 +470,26 @@ def reader(src):  # read(offset, size) on bytes or on an open file, never past i
         return src.read(min(n, size - o))
     return read
 
-def elf(name, read):
+def elf(name, box, read):
     h = read(0, 64)
-    machine = struct.unpack(">H" if h[5] == 2 else "<H", h[18:20])[0]
+    etype, machine = struct.unpack(">HH" if h[5] == 2 else "<HH", h[16:20])
     machines[machine] += 1
-    desc = "e_machine %d (%s)" % (machine, ARCH.get(machine, "other"))
-    if machine != 183 or h[4] != 2 or h[5] != 1:
-        desc += (", ELF32" if h[4] == 1 else "") + (", big-endian" if h[5] == 2 else "")
-        return report(name, desc, ["not aarch64, " + desc])
-    etype, phoff = struct.unpack("<H", h[16:18])[0], struct.unpack("<Q", h[32:40])[0]
+    arch = ARCH.get(machine, "other")
+    head = "e_machine %d (%s)" % (machine, arch) + (", ELF32" if h[4] == 1 else "") + (", big-endian" if h[5] == 2 else "")
+    other = machine != 183 or h[4] != 2 or h[5] != 1
+    if etype == 1:  # an object file: a build input that no loader reads
+        e = add(name, box, head + ", relocatable object")
+        if other:
+            e["checks"].append("object file with no aarch64 code (%s); a native arm64 build that links it fails" % head)
+        return
+    if etype == 4:
+        return add(name, box, head + ", core dump")
+    if h[7] in OS_ABI:
+        return add(name, box, head + " (a %s build; Linux does not load it)" % OS_ABI[h[7]])
+    if h[4] != 2 or h[5] != 1:  # 32-bit or big-endian: not read further
+        return add(name, box, head, probs=["not aarch64, " + head], loadable=True, arch=arch, libc="", glibc="", cxx="", vers=[])
+    phoff = struct.unpack("<Q", h[32:40])[0]
     phentsize, phnum = struct.unpack("<HH", h[54:58])
-    if etype in (1, 4):
-        return report(name, desc + (", relocatable object" if etype == 1 else ", core dump"))
     loads, dyn, interp, android, phentsize = [], b"", "", False, phentsize or 56
     ph = read(phoff, phentsize * phnum)
     for k in range(0, len(ph) - 55, phentsize):
@@ -295,6 +528,10 @@ def elf(name, read):
         e = st.find(b"\0", o)
         return st[o:e if e >= 0 else len(st)].decode("latin-1")
     names, vers = [string(n) for n in needed], []
+    osname = [s for n, s in (("libc.so.7", "FreeBSD"), ("libc.so.12", "NetBSD"), ("libc.so.1", "Solaris")) if n in names] + [
+        "OpenBSD" for n in names if re.match(r"libc\.so\.[0-9]+\.[0-9]+$", n)]
+    if osname:  # the C library of another system
+        return add(name, box, head + " (a %s build; Linux does not load it)" % osname[0])
     o = off(tags[0x6FFFFFFE]) if 0x6FFFFFFE in tags else -1  # DT_VERNEED: the versions needed, by library
     for _ in range(tags.get(0x6FFFFFFF, 0) if o >= 0 else 0):
         vn = read(o, 16)
@@ -332,57 +569,94 @@ def elf(name, read):
         libc = "C library not named"
     align = min(a for _, _, _, a in loads) if loads else 0
     voff = min([(v - o) & (o - v) for v, o, _, _ in loads if v != o] or [0])  # largest power of two dividing p_vaddr - p_offset
-    desc += ", " + libc + "".join(", " + x for x in ("GLIBC_" + glibc if glibc else "", "GLIBCXX_" + cxx if cxx else "") if x)
+    desc = head + ", " + libc + "".join(", " + x for x in ("GLIBC_" + glibc if glibc else "", "GLIBCXX_" + cxx if cxx else "") if x)
     desc += (", LOAD align %#x" % align if loads else "") + (", vaddr-offset align %#x" % voff if 0 < voff < 0x10000 else "")
     desc += ", needs " + " ".join(names) if names else ""
-    p = []
+    e = add(name, box, desc, loadable=True, arch=arch, libc=libc, glibc=glibc, cxx=cxx, vers=vers, needed=names,
+            interp=interp)
+    p, c = e["probs"], e["checks"]
+    if other:
+        return p.append("not aarch64, " + head)
+    e["small"] = bool(loads) and (align < 0x10000 or 0 < voff < 0x10000)
     if libc == "android":
         p.append("Android build (bionic C library), not for glibc or musl")
-    elif (LIBC, libc) in (("glibc", "musl"), ("musl", "glibc")):
-        p.append("%s build; the target uses %s" % (libc, LIBC))
+    elif libc == "musl" and LIBC == "glibc":
+        p.append("musl build; the target uses glibc")
+    elif libc == "glibc" and LIBC == "musl":
+        own = [n for n in names if GLIBC_LIBS.match(n)]
+        refused = (["interpreter " + interp] if "ld-linux" in interp else []) + [
+            n for n in own if not (n.startswith("lib") and n[3:].startswith(MUSL_SELF))]
+        image = root_has(ROOT, refused)  # the image's own files (gcompat's glibc loader, for example)
+        refused = [n for n in refused if n not in image]
+        if refused:
+            p.append("glibc build; musl's loader does not provide " + ", ".join(refused))
+        else:
+            c.append(musl_check(own, image, [n for n in names if n not in own]))
+    if LIBC == "glibc" and ROOT and libc not in ("musl", "android"):
+        p.extend(root_needs(vers, ROOT))  # the versions each library of the image defines
     if LIBC == "glibc" and VER and glibc and libc != "musl" and vkey(glibc) > vkey(VER):
         p.append("needs GLIBC_%s; the target has glibc %s" % (glibc, VER))
-    if CXX and cxx and vkey(cxx) > vkey(CXX):
+    if LIBC == "glibc" and CXX and cxx and vkey(cxx) > vkey(CXX):  # musl's loader checks no symbol versions
         p.append("needs GLIBCXX_%s; the target's libstdc++ provides up to GLIBCXX_%s" % (cxx, CXX))
     if PAGE and loads:
         # glibc 2.34 and earlier refuse a PT_LOAD whose p_align is not a multiple of the page size; glibc 2.35 and
-        # later, and musl, need p_vaddr - p_offset to be one. Unknown target C library or version: both rules.
-        old = not (LIBC == "musl" or LIBC == "glibc" and VER and vkey(VER) >= (2, 35))
-        new = not (LIBC == "glibc" and VER and vkey(VER) < (2, 35))
+        # later, and musl, need p_vaddr - p_offset to be one. Unknown glibc version: both rules.
+        old = not (LIBC == "musl" or REL and vkey(REL) >= (2, 35))
+        new = not (LIBC == "glibc" and REL and vkey(REL) < (2, 35))
         bad = [a for _, _, _, a in loads if a % PAGE]
         if old and bad:
             p.append("LOAD align %#x is not a multiple of the %d-byte page size" % (min(bad), PAGE))
         if new and any((v - o) % PAGE for v, o, _, _ in loads):
             p.append("LOAD vaddr-offset align %#x is not a multiple of the %d-byte page size" % (voff, PAGE))
-    report(name, desc, p)
 
-def archive(name, data):  # static library: the ELF objects it holds
-    o, m = 8, collections.Counter()
+def archive(name, box, data):  # static library: the object files it holds
+    o, m, other = 8, collections.Counter(), collections.Counter()
     while o + 60 <= len(data):
         try:
             size = int(data[o + 48:o + 58].decode("ascii").strip() or "0")
         except ValueError:
             break
-        h = data[o + 60:o + 80]
+        tag = data[o:o + 16].rstrip()
+        skip = int(tag[3:]) if tag.startswith(b"#1/") and tag[3:].isdigit() else 0  # BSD ar: the name comes first
+        h = data[o + 60 + skip:o + 60 + skip + 20]
         if h[:4] == b"\x7fELF" and len(h) == 20:
             m[struct.unpack(">H" if h[5] == 2 else "<H", h[18:20])[0]] += 1
+        elif h[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce"):
+            other["Mach-O"] += 1
         o += 60 + size + (size & 1)
-    other = ", ".join("e_machine %d (%s)" % (k, ARCH.get(k, "other")) for k in sorted(m) if k != 183)
-    report(name, "static archive, ELF objects by e_machine %s" % dict(sorted(m.items())),
-           ["static archive with %s objects; an aarch64 build cannot link it" % other] if other else [])
+    if not m:
+        return add(name, box, "static archive with no ELF members%s: another system's format" % (
+            " (%s objects)" % ", ".join(sorted(other)) if other else ""))
+    e = add(name, box, "static archive, ELF objects by e_machine %s" % dict(sorted(m.items())))
+    if 183 not in m:
+        e["checks"].append("static library with no aarch64 code (%s); a native arm64 build that links it fails" % (
+            ", ".join("e_machine %d (%s)" % (k, ARCH.get(k, "other")) for k in sorted(m))))
 
-def check(name, h, load):
+def digest(src):  # SHA-256 of a member's bytes or of a loose file, read in parts: copies of one file are one build
+    if isinstance(src, bytes):
+        return hashlib.sha256(src).hexdigest()
+    s, pos = hashlib.sha256(), src.tell()
+    src.seek(0)
+    for b in iter(lambda: src.read(1 << 20), b""):
+        s.update(b)
+    src.seek(pos)
+    return s.hexdigest()
+
+def check(name, box, h, load):
     try:
         if h[:4] == b"\x7fELF":
-            elf(name, reader(load()))
+            src, n = load(), len(entries)
+            elf(name, box, reader(src))
+            for e in entries[n:]:
+                e["sha"] = digest(src)
         elif h[:8] == b"!<arch>\n":
             src = load()
-            archive(name, src if isinstance(src, bytes) else reader(src)(0, os.fstat(src.fileno()).st_size))
+            archive(name, box, src if isinstance(src, bytes) else reader(src)(0, os.fstat(src.fileno()).st_size))
         elif h[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce") or \
                 h[:4] == b"\xca\xfe\xba\xbe" and len(h) >= 8 and struct.unpack(">I", h[4:8])[0] < 30:  # a universal binary; other formats share the magic
-            report(name, "Mach-O (a macOS build; Linux does not load it)")
+            add(name, box, "Mach-O (a macOS build; Linux does not load it)")
         elif h[:2] == b"MZ" and len(h) >= 64 and h[struct.unpack("<I", h[60:64])[0]:][:4] == b"PE\0\0":
-            report(name, "PE (a Windows build; Linux does not load it)")
+            add(name, box, "PE (a Windows build; Linux does not load it)")
         elif h[:4] == b"PK\x03\x04":
             src = load()
             with zipfile.ZipFile(io.BytesIO(src) if isinstance(src, bytes) else src) as z:
@@ -390,10 +664,56 @@ def check(name, h, load):
                     if not m.filename.endswith("/"):
                         with z.open(m) as f:
                             mh = f.read(4096)
-                        check(name + "!" + m.filename, mh, lambda m=m, z=z: z.read(m))
+                        check(name + "!" + m.filename, name, mh, lambda m=m, z=z: z.read(m))
     except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError, struct.error, ValueError) as e:
         print("could not read: %s (%s)" % (name, e))
 
+def library(name):  # the builds of one library share this name
+    n = name.rsplit("!", 1)[-1].rsplit("/", 1)[-1].lower()
+    ext = re.match(r"(.+?)\.(cpython-|pypy|abi3\.)", n)  # a Python extension module: the name before its suffix
+    if ext and n.endswith(".so"):
+        return ext.group(1)
+    n = re.sub(r"\.so(\.[0-9]+)+$", ".so", n)
+    n = re.sub(r"([-_.])linux(32|64)(?=[-_.]|$)", r"\1linux", n)
+    n = re.sub(r"([-_.])linux(musl|gnu)(?=[-_.]|$)", r"\1linux", n)  # sharp-linuxmusl-arm64
+    prev = None
+    while prev != n:
+        prev, n = n, NAME_PARTS.sub("", n)
+    return n
+
+def x86_refused(x):  # what an x86-64 glibc build needs that musl's loader does not answer itself and the image lacks;
+    # the image's glibc loader (gcompat) stands in for the x86-64 one, which the image's x86-64 variant would carry instead
+    names = (["interpreter " + x.get("interp", "")] if "ld-linux" in x.get("interp", "") else []) + [
+        n for n in x.get("needed", []) if GLIBC_LIBS.match(n) and not (n.startswith("lib") and n[3:].startswith(MUSL_SELF))]
+    image = root_has(ROOT, [n for n in names if "ld-linux" not in n])
+    return [n for n in names if n not in image and not ("ld-linux" in n and ROOT and ROOT["glibc_loader"])]
+
+def baseline(e, g, problem):  # the same glibc, libstdc++ or musl-loader problem in the x86-64 build: not a Graviton change
+    for x in g:
+        same = e["arch"] == "aarch64" and x["arch"] == "x86-64" and x["libc"] == e["libc"]
+        shared = root_shared([problem], x.get("vers", [])) if same else ""
+        need = x86_refused(x) if same and problem.startswith("glibc build; musl") and all(  # no x86-64 musl build
+            y["libc"] == "glibc" for y in g if y.get("arch") == "x86-64") else []
+        if shared or need:
+            return "; the x86-64 build %s needs %s too, so x86-64 hosts with this OS fail as well (not a Graviton change)" % (
+                x["name"], shared or ", ".join(need))
+    for key, prefix, tgt in (("glibc", "needs GLIBC_", VER), ("cxx", "needs GLIBCXX_", CXX)):
+        if not (problem.startswith(prefix) and tgt and e["arch"] == "aarch64"):
+            continue
+        for x in g:
+            if x["arch"] == "x86-64" and x["libc"] == e["libc"] and x[key] and vkey(x[key]) > vkey(tgt):
+                return "; the x86-64 build %s needs %s%s too, so x86-64 hosts with this OS fail as well (not a Graviton change)" % (
+                    x["name"], prefix[6:], x[key])
+    return ""
+
+tl = "target: " + LIBC + (" (assumed)" if ASSUMED else "") + (", with a glibc loader" if ROOT and ROOT["glibc_loader"] else "")
+if LIBC == "glibc":
+    tl += (" " + REL) if REL else (", glibc release not read" if ROOT else ", glibc version not given")
+elif VER:
+    tl += " " + VER
+TCXX = CXX or (ROOT["glibcxx"] if ROOT else "")
+tl += (", page size %d" % PAGE if PAGE else ", page size not given") + (", libstdc++ GLIBCXX_" + TCXX if TCXX and LIBC == "glibc" else "")
+print(tl + root_read_from(ROOT))
 missing = [p for p in sys.argv[1:] if not os.path.exists(p)]
 for p in missing:
     print("no such file or directory:", p)
@@ -407,19 +727,54 @@ for top in sys.argv[1:]:
             p = os.path.join(root, n)
             if os.path.isfile(p) and not os.path.islink(p):
                 with open(p, "rb") as f:
-                    check(p, f.read(4096), lambda f=f: f)
+                    check(p, top, f.read(4096), lambda f=f: f)
 
-for line in sorted(lines):
-    print(line)
+findings, checks, notes, groups = [], [], [], collections.OrderedDict()
+if ROOT and IGNORED:
+    notes.append("%s set but not used: TARGET_ROOT gives the C library and its versions" % ", ".join(IGNORED))
+for e in entries:
+    if e["loadable"]:
+        groups.setdefault((e["box"], library(e["name"])), []).append(e)
+    else:
+        if e["checks"]:
+            checks.append("%s: %s" % (e["name"], "; ".join(e["checks"])))
+for (box, lib), g in groups.items():
+    ok = [e for e in g if not e["probs"]]
+    if ok:  # the build for the target (no CHECK and its C library first) is judged; the other builds get no flag
+        pick = sorted(ok, key=lambda e: (bool(e["checks"]), e["libc"] not in (LIBC, "needs no C library")))[0]
+        for e in g:
+            e["replaced"] = e is not pick  # another build of the library is the one for the target
+        if pick["checks"]:
+            checks.append("%s: %s" % (pick["name"], "; ".join(pick["checks"])))
+        builds = len(set(e.get("sha") or e["name"] for e in g))  # copies of one file are one build
+        if builds > 1:
+            notes.append("%s: %d Linux builds in %s; %s is the build for this target; confirm in Phase 3 that it is the "
+                         "one loaded" % (lib, builds, "the scanned files" if box in sys.argv[1:] else box, pick["name"]))
+        continue
+    arm = [e for e in g if e["arch"] == "aarch64"]
+    primary = ([e for e in arm if e["libc"] in (LIBC, "needs no C library")] or [e for e in arm if e["libc"] != "android"]
+               or arm or [e for e in g if e["arch"] == "x86-64"][:1] or g[:1])
+    for e in g:
+        e["replaced"] = e not in primary
+    for e in primary:  # the build the target would load carries the finding
+        findings.append("%s: %s" % (e["name"], "; ".join(x + baseline(e, g, x) for x in e["probs"])))
+        if e["checks"]:
+            checks.append("%s: %s" % (e["name"], "; ".join(e["checks"])))
+small = sorted(e["name"] for e in entries if e["small"] and not e.get("replaced"))
+if small and not PAGE:
+    notes.insert(0, "%d aarch64 file(s) aligned for 4 KB pages only (%s%s): a kernel with 64 KB pages refuses them; give "
+                    "the page size if the target uses 64 KB pages" % (len(small), ", ".join(small[:5]),
+                                                                       " and %d more" % (len(small) - 5) if len(small) > 5 else ""))
+for e in sorted(entries, key=lambda x: x["name"]):
+    print("%s: %s" % (e["name"], e["desc"]))
 print("ELF files by e_machine:", dict(sorted(machines.items())))
-if LIBC:
-    print("target: %s %s, %s" % (LIBC, VER or "(version not set)",
-                                 "page size %d" % PAGE if PAGE else "page size not set (LOAD alignment not judged)"))
-else:
-    print("target: not set (TARGET_LIBC, TARGET_LIBC_VER, TARGET_PAGE_SIZE from Phase 1.1); only the architecture and Android checks ran")
-for f in sorted(findings):
-    print("FINDING " + f)
-print("findings: %d" % len(findings))
+for x in sorted(findings):
+    print("FINDING " + x)
+for x in sorted(checks):
+    print("CHECK " + x)
+for x in notes:
+    print("NOTE " + x)
+print("findings: %d, checks: %d" % (len(findings), len(checks)))
 sys.exit(2 if missing else 1 if findings else 0)
 EOF
 }
@@ -430,23 +785,41 @@ native_scan . | tee graviton-validation/raw/site-packages-so-scan.txt
 Executed on the fixture:
 
 ```
-./vendor/_fixture_ext.cpython-311-x86_64-linux-gnu.so: e_machine 62 (x86-64)
-./vendor/libfastsum-x86_64.so: e_machine 62 (x86-64)
-ELF files by e_machine: {62: 2}
 target: glibc 2.41, page size 4096
+./vendor/_fixture_ext.cpython-311-x86_64-linux-gnu.so: e_machine 62 (x86-64), glibc, GLIBC_2.2.5, LOAD align 0x1000, vaddr-offset align 0x1000, needs libc.so.6
+./vendor/libfastsum-x86_64.so: e_machine 62 (x86-64), glibc, GLIBC_2.2.5, LOAD align 0x1000, vaddr-offset align 0x1000, needs libc.so.6
+ELF files by e_machine: {62: 2}
 FINDING ./vendor/_fixture_ext.cpython-311-x86_64-linux-gnu.so: not aarch64, e_machine 62 (x86-64)
 FINDING ./vendor/libfastsum-x86_64.so: not aarch64, e_machine 62 (x86-64)
-findings: 2
+findings: 2, checks: 0
 ```
 
-Every `FINDING` line is a finding, and the scan exits with status 1 when it prints one. It judges one target per run: when the project deploys to several (for example an Alpine image and an arm64 Lambda function), run it once with each target's values, because a pass for one target says nothing about another.
+On the fixed fixture, which ships an aarch64 build next to each x86-64 one:
 
-- `not aarch64`: built for another architecture (e_machine 183 is aarch64, 62 is x86-64, 3 is 32-bit x86, 40 is 32-bit Arm). An x86-64 file is acceptable only next to an aarch64 build of the same library that this scan confirms and that the code selects on aarch64 (§1.4); a name that says aarch64 is not evidence.
+```
+target: glibc 2.41, page size 4096
+./vendor/_fixture_ext.cpython-311-aarch64-linux-gnu.so: e_machine 183 (aarch64), needs no C library, LOAD align 0x10000
+./vendor/_fixture_ext.cpython-311-x86_64-linux-gnu.so: e_machine 62 (x86-64), glibc, GLIBC_2.2.5, LOAD align 0x1000, vaddr-offset align 0x1000, needs libc.so.6
+./vendor/libfastsum-aarch64.so: e_machine 183 (aarch64), needs no C library, LOAD align 0x10000
+./vendor/libfastsum-x86_64.so: e_machine 62 (x86-64), glibc, GLIBC_2.2.5, LOAD align 0x1000, vaddr-offset align 0x1000, needs libc.so.6
+ELF files by e_machine: {62: 2, 183: 2}
+NOTE _fixture_ext: 2 Linux builds in the scanned files; ./vendor/_fixture_ext.cpython-311-aarch64-linux-gnu.so is the build for this target; confirm in Phase 3 that it is the one loaded
+NOTE libfastsum.so: 2 Linux builds in the scanned files; ./vendor/libfastsum-aarch64.so is the build for this target; confirm in Phase 3 that it is the one loaded
+findings: 0, checks: 0
+```
+
+Every `FINDING` line is a finding, and the scan exits with status 1 when it prints one. A `CHECK` line is settled by loading the file in the target image (Phase 3); a `NOTE` changes no verdict. The first line names the target, `glibc (assumed)` when neither `TARGET_ROOT` nor `TARGET_LIBC` is set. It judges one target per run: run it once with each target's values (for example an Alpine image and an arm64 Lambda function).
+
+- `not aarch64`: built for another architecture (e_machine 183 is aarch64, 62 is x86-64, 3 is 32-bit x86, 40 is 32-bit Arm).
+- Several Linux builds of one library (file names that differ only by architecture or C library parts, such as `libfastsum-x86_64.so` and `libfastsum-aarch64.so`): the scan judges the target's build by content and names it in a `NOTE`; the other builds get no line, and a `FINDING` means no build suits. The code must load it on aarch64 (§1.4).
 - `Android build`: the file needs a bare `libc.so` and carries Android's ELF note, so it was built against Android's C library (bionic), not glibc or musl.
-- `musl build` or `glibc build`: built for the other C library than the target's.
+- `musl build` or `glibc build; musl's loader does not provide`: built for the other C library than the target's. A glibc build that needs no glibc library musl's loader lacks is a `CHECK`: it loads on musl only if it uses no symbol that only glibc defines.
 - `needs GLIBC_2.N`: newer than the target's glibc, which refuses to load it with `version 'GLIBC_2.N' not found`. Only versions needed from glibc's own libraries count.
-- `needs GLIBCXX_3.4.N`: newer than the target image's libstdc++ (judged only when `TARGET_GLIBCXX` is set, below).
-- `LOAD align` or `LOAD vaddr-offset align`: not linked for the target's page size (below).
+- `needs GLIBCXX_3.4.N`: newer than the target image's libstdc++ (judged only for a glibc target, with `TARGET_ROOT` or `TARGET_GLIBCXX` set, below).
+- When the x86-64 build needs the same version or library, the line says so: x86-64 hosts with this OS fail as well, so the OS or the package version is the change.
+- `LOAD align` or `LOAD vaddr-offset align`: not linked for the target's page size (below). Without `TARGET_PAGE_SIZE`, one `NOTE` lists the aarch64 files linked for 4 KB pages only.
+- `object file with no aarch64 code` or `static library with no aarch64 code`: a `CHECK`, because no loader reads them but an arm64 build that links them fails.
+- With `TARGET_ROOT`, the target line ends with `read from <folder> (<os-release name>)`, and a version finding names the library: `needs GLIBC_2.35 from libm.so.6; the target's libm.so.6 defines up to GLIBC_2.32`. On a musl image with gcompat, a `CHECK` also lists the glibc files the image has.
 
 Wheels from the index get the C library and glibc checks through their tags in §1.3. The scan's checks matter most for files committed to the repository, which no tag describes. The `needs` list names the libraries the loader must find on the target: each must come from the target image or travel with the file, and a load that cannot find one fails (executed on arm64 with NumPy 1.26.4's `numpy.libs` folder removed: `OSError: libopenblas64_p-r0-17488984.3.23.dev.so: cannot open shared object file: No such file or directory` from `ctypes.CDLL`). A CPython extension's filename states the target it was built for (`*.cpython-311-x86_64-linux-gnu.so` for x86_64 Python 3.11, `*.cpython-311-aarch64-linux-gnu.so` for Graviton); the scan confirms that the content matches.
 
@@ -462,24 +835,7 @@ For a Lambda layer or vendored directory, list `*.dist-info` to get `name==versi
 
 For a target with 64KB pages (§1.1), an aarch64 file must also be linked for that page size, and which value the loader checks depends on the target's C library: glibc 2.34 and earlier refuse a `PT_LOAD` segment whose `p_align` is not a multiple of the page size (`ELF load command alignment not page-aligned`). glibc 2.35 and later instead refuse one whose `p_vaddr - p_offset` is not a multiple of it (`ELF load command address/offset not page-aligned`). musl's loader rounds both values down to the page size and maps the segment without checking either. The scan prints each aarch64 file's smallest `LOAD align`, and its `vaddr-offset align` (the largest power of two dividing every segment's `p_vaddr - p_offset`) when that is below `0x10000`. With `TARGET_PAGE_SIZE` set, it applies the rule of the target's C library and version, and both rules when the version is not set.
 
-When the scan prints `GLIBCXX_` for a file committed to the repository, set `TARGET_GLIBCXX` to the highest version the target image's libstdc++ provides, so the scan judges it:
-
-```bash
-# The highest GLIBCXX_ version the target image's libstdc++ provides: the image's own loader finds the
-# library (ctypes), /proc/self/maps names the file it loaded, and its version names are read from it.
-$CONTAINER_CMD run --rm --init --platform linux/arm64 --entrypoint python3 "$IMG" -c '
-import ctypes, re, signal
-signal.alarm(120)
-try:
-    ctypes.CDLL("libstdc++.so.6")
-except OSError:
-    raise SystemExit("glibcxx=none (the image has no libstdc++.so.6)")
-path = [l.split()[-1] for l in open("/proc/self/maps") if "/libstdc++.so" in l][0]
-v = re.findall(rb"GLIBCXX_(3\.4\.[0-9]+)\x00", open(path, "rb").read())
-print("glibcxx=%s (%s)" % (max((x.decode() for x in v), key=lambda s: tuple(map(int, s.split("."))), default="none"), path))'
-```
-
-Executed on `linux/arm64` images: `python:3.11-slim` (Debian 13) and the Lambda base image `public.ecr.aws/lambda/python:3.12` (Amazon Linux 2023) printed `glibcxx=3.4.33`, `public.ecr.aws/lambda/python:3.11` (Amazon Linux 2) `glibcxx=3.4.24`, and `python:3.11-alpine` `glibcxx=none`, so on Alpine a file whose `needs` list names `libstdc++.so.6` also needs the image to install it.
+With `TARGET_ROOT`, the scan judges each file's `GLIBCXX_` needs against the image's own libstdc++, whose highest version the §1.1 block prints (`GLIBCXX_3.4.33` for `python:3.11-slim`). Without an image folder, the scan judges them only when `TARGET_GLIBCXX` is set to the highest version the target's libstdc++ provides. An image with no `libstdc++.so.6` (`python:3.11-alpine`) has to install it for a file whose `needs` list names it.
 
 Then find extensions the project builds and their sources:
 
@@ -579,13 +935,13 @@ A package with no arm64 candidate is a MUST UPGRADE finding, and its substitute 
 ### 1.2.3 Tiered Validation Policy
 
 **FAIL immediately if:**
-- the §1.2.1 scan prints a `FINDING` for the file AND confirms no build of the same library without one AND no source in the repository AND the user cannot provide such a build
+- the §1.2.1 scan prints a `FINDING` for the file (so no build of its library beside it suits the target) AND no source in the repository AND the user cannot provide such a build
 
 **WARN but proceed if:**
 - Source is present (the extension or library can be rebuilt on aarch64 in Phase 2.1), OR a pure-Python fallback path exists (for example `fast_sum` falling back to `sum()` when the load fails), OR the binary is an optional accelerator
 
 **PASS if:**
-- the scan prints no `FINDING` for the file, OR both an x86_64 and an aarch64 build are present (each confirmed by the scan, not by its name), the aarch64 one has no `FINDING`, and the code selects it at runtime
+- the scan prints no `FINDING` for the file, and when a `NOTE` names another build of its library for this target, Phase 3 shows the code loads that build
 
 For x86-only binaries: locate the source, document the rebuild, or ask the user for an aarch64 build. Validate with:
 ```bash
@@ -607,9 +963,10 @@ The Python equivalent of a "native-artifact-only tree" is the probe output: one 
 
 ```bash
 PYVER=3.11; ABI="cp${PYVER/./}"
-TARGET_LIBC=glibc; TARGET_LIBC_VER=2.41   # from the target probe in §1.1 (Alpine: TARGET_LIBC=musl TARGET_LIBC_VER=1.2)
+TARGET_LIBC=glibc; TARGET_LIBC_VER=2.41   # from the target probe in §1.1 (Alpine: TARGET_LIBC=musl TARGET_LIBC_VER=1.2; no target named: both empty)
 platforms() { # $1=arch ; sets PLAT to one --platform flag per wheel tag the target's libc accepts, newest first
   local i="${TARGET_LIBC_VER#*.}"; PLAT=()
+  case "$i" in ''|*[!0-9]*) i=99;; esac   # no version given: every tag; the wheel's tag names the version it needs
   if [ "$TARGET_LIBC" = musl ]; then
     while [ "$i" -ge 1 ]; do PLAT+=(--platform "musllinux_1_${i}_$1"); i=$((i - 1)); done
   else

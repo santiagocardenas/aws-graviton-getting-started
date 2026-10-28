@@ -67,7 +67,7 @@ if . "${TMPDIR:-/tmp}/graviton-python-native_scan.sh"; then
   while [ "$i" -ge 17 ]; do PLAT+=(--platform "manylinux_2_${i}_aarch64"); i=$((i - 1)); done
   python3 -m pip install "${PLAT[@]}" --platform manylinux2014_aarch64 --only-binary=:all: \
     --python-version "$PYVER" --implementation cp --target python/ -r layer-requirements.txt
-  native_scan python   # the function from Phase 1.2.1: no FINDING line
+  TARGET_ROOT= native_scan python   # the function from Phase 1.2.1, without an image folder (the runtime has none): no FINDING line
 else echo "CHECK: run the Phase 1.2.1 scan block first: it writes ${TMPDIR:-/tmp}/graviton-python-native_scan.sh"; fi
 ```
 

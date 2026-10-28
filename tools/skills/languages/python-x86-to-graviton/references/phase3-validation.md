@@ -42,7 +42,7 @@ echo "Container runtime: ${CONTAINER_CMD:-none}"
 ARCH=$(uname -m)
 echo "Host architecture: $ARCH"
 
-# On an x86 host, confirm arm64 images actually run (QEMU/binfmt must be registered)
+# On an x86 host, check that arm64 images run (only with an emulator the host already has)
 if [ -n "$CONTAINER_CMD" ] && [ "$ARCH" = "x86_64" ]; then
   $CONTAINER_CMD run --rm --init --platform linux/arm64 alpine:3.20 timeout 30 uname -m   # must print aarch64
 fi
@@ -54,6 +54,7 @@ A `command -v` cascade can pick a runtime that cannot run anything: on the x86 h
 - **ARM64 host (aarch64/arm64) + container runtime:** Install, build and validate in containers using `$CONTAINER_CMD`. This is the ideal path.
 - **ARM64 host (aarch64/arm64) + no container runtime:** Validate directly on the host, in a virtual environment (§3.0).
 - **x86 host + container runtime with ARM64 support:** Use `--platform linux/arm64`. On x86 Linux this runs under QEMU emulation, which works for installing wheels, importing and testing, but is slow (see "Emulation limits" below).
+- **x86 host + container runtime that cannot run arm64 images:** as with no container runtime. Do not register an emulator, a privileged host change that is the user's decision.
 - **x86 host + no container runtime:** Static analysis only (Phase 1). Document that ARM64 validation needs a Graviton host or the target, and recommend one.
 
 **Match the production hosts.** A Phase 3 check passes only on a Graviton host with the production OS and page size (Phase 1.1), or on the target itself, such as the arm64 Lambda function. A `linux/arm64` run under emulation or on another arm64 machine finds failures early, but its CPU and kernel differ from Graviton's: QEMU on an x86 host can report SVE with 512-bit vectors and SME, while Graviton2 has no SVE, Graviton3 has 256-bit SVE, Graviton4 and Graviton5 have 128-bit SVE and SVE2, and none has SME (measured on each), and numpy's `np.dot` computed there matched no Graviton generation's result, because OpenBLAS picks its kernel from the CPU it sees; Apple's M1 to M3 cores have no SVE, and the M4 has SME without SVE ([LLVM's processor definitions](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AArch64/AArch64Processors.td)); and a container uses its host's kernel, so a host whose page size is smaller than production's (an x86 host has 4KB pages; on a Mac, run `getconf PAGESIZE` in its VM) does not show the failures of 64KB pages. When the project builds its own native code, run its tests on the oldest Graviton generation it deploys to (Phase 2.5): a newer generation does not show `Illegal instruction`. Record where each check ran in `06-build-test-results.md`.
@@ -62,7 +63,7 @@ A `command -v` cascade can pick a runtime that cannot run anything: on the x86 h
 
 Throughout Phase 3, replace `docker` with `$CONTAINER_CMD` in all commands. `CONTAINER_CMD` exists only in the shell that set it: if each command runs in a new shell, start a later block with `CONTAINER_CMD=<the detected runtime>`. A function a later block calls is saved to a file under `${TMPDIR:-/tmp}` by the block that defines it, and the later block loads it in its first lines.
 
-**Emulation limits (x86 host).** Observed while validating this skill with Docker 25.0 and QEMU registered through binfmt_misc:
+**Emulation limits (x86 host).** Observed with Docker 25.0 and QEMU:
 
 - **Bound every container run, inside the container.** Each `timeout` value in the blocks is an upper bound, so a stuck command fails instead of holding the session; raise it when a project needs longer. Five runs wrapped as `timeout N docker run ...` did not stop at their limit: Docker forwarded the stop signal into the emulated container, the container froze (even a plain `sleep 60` never finished), and the command waited until it was cancelled while the container kept running for hours until `docker rm -f`. Put the limit inside the container and remove the container afterwards:
   ```bash
@@ -224,10 +225,10 @@ $CONTAINER_CMD run --rm --platform linux/arm64 --entrypoint python3 app:arm64 \
   -c 'import platform, sys; print(platform.machine(), sys.version.split()[0])'     # must print aarch64
 
 # Every native file in the image's Python environment, judged for the target by native_scan from Phase 1.2.1
-# (loaded on the next line, with the TARGET_* values of §1.1). The files are copied out of the image and
-# scanned here, so no part of the scan runs under emulation.
+# (loaded on the next line, with the target of §1.1). The files are copied out of the image and scanned
+# here, so no part of the scan runs under emulation.
 if . "${TMPDIR:-/tmp}/graviton-python-native_scan.sh"; then
-  TARGET_LIBC=glibc; TARGET_LIBC_VER=2.41; TARGET_PAGE_SIZE=4096   # the §1.1 values
+  TARGET_ROOT=${GV_ROOT-}; TARGET_PAGE_SIZE=4096   # §1.1: the base image's folder (without it, TARGET_LIBC and TARGET_LIBC_VER)
   GV_SITE=$(mktemp -d "${TMPDIR:-/tmp}/gv-site.XXXXXX"); CID=$($CONTAINER_CMD create --platform linux/arm64 app:arm64)
   $CONTAINER_CMD run --rm --platform linux/arm64 --entrypoint python3 app:arm64 -c \
     'import sysconfig; print("\n".join(sorted({sysconfig.get_paths()[k] for k in ("purelib", "platlib")})))' |

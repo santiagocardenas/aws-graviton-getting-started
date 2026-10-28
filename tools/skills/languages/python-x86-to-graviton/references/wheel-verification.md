@@ -63,11 +63,12 @@ pip version floors (from [pip's changelog](https://pip.pypa.io/en/stable/news/))
 This runs on any host (x86 laptops and CI included) because `pip download` with explicit platform flags never executes code from the package. It asks the index: "for this exact pin, Python X.Y, CPython ABI, and these Linux ARM64 platform tags, is there a binary wheel?"
 
 ```bash
-# The target's libc from Phase 1.1 (Amazon Linux 2023: glibc 2.34; Alpine: TARGET_LIBC=musl TARGET_LIBC_VER=1.2)
+# The target's libc from Phase 1.1 (Amazon Linux 2023: glibc 2.34; Alpine: TARGET_LIBC=musl TARGET_LIBC_VER=1.2; no target named: both empty)
 TARGET_LIBC=glibc; TARGET_LIBC_VER=2.34
 # pip matches each --platform value exactly: offer every tag the target's libc accepts, newest first
 platforms() { # $1=arch ; sets PLAT
   local i="${TARGET_LIBC_VER#*.}"; PLAT=()
+  case "$i" in ''|*[!0-9]*) i=99;; esac   # no version given: every tag; the wheel's tag names the version it needs
   if [ "$TARGET_LIBC" = musl ]; then
     while [ "$i" -ge 1 ]; do PLAT+=(--platform "musllinux_1_${i}_$1"); i=$((i - 1)); done
   else
