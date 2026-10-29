@@ -24,8 +24,9 @@ CC=aarch64-linux-gnu-gcc make
 # Or on ARM64 machine (distro defaults are correct for Graviton)
 make
 
-# Verify
-file libname.so  # Should show "ARM aarch64"
+# Verify with the Phase 1.2.1 check (GV_TARGET from Phase 1.1; without python3, "${GV_PY[@]}" of Phase 1.2.1)
+[ -n "${GV_TARGET+set}" ] || GV_TARGET=()   # an unset array is one empty word in zsh
+python3 "${TMPDIR:-/tmp}/java_graviton_check.py" "${GV_TARGET[@]}" libname.so   # no FINDING line
 ```
 
 **If source unavailable:** Prompt user for ARM64-compatible version or confirm pure Java fallback.
@@ -54,7 +55,7 @@ try {
 
 > **Output: update `graviton-validation/03-dependency-compatibility-report.md`**
 
-Update ONLY dependencies flagged as MUST UPGRADE (i.e. the resolved JAR was confirmed to lack the `linux/aarch64` binary; see the verification note in Phase 1.3). Do NOT upgrade compatible dependencies. Prefer the *lowest* version whose ARM64 binary works on the target, not the latest, to stay minimal: **confirm that candidate's JAR actually contains the aarch64 binary** (`scan_archive` from Phase 1.2.1 shows an `ARM aarch64` line) rather than trusting a remembered version number, and that the libraries the binary needs (`readelf -d` lists them) are in the target image (`netty-tcnative`'s `linux-aarch_64-fedora` builds need libraries the Amazon Linux 2023 images do not include (`libssl.so.1.1` up to at least 2.0.66, `libapr-1.so.0` in 2.0.84), while `netty-tcnative-boringssl-static` needs only glibc's libraries); the exact floor varies by library and some intermediate versions are unpublished.
+Update ONLY dependencies flagged as MUST UPGRADE (i.e. the resolved JAR was confirmed to lack the `linux/aarch64` binary; see the verification note in Phase 1.3). Do NOT upgrade compatible dependencies. Prefer the *lowest* version whose ARM64 binary works on the target, not the latest, to stay minimal: **confirm that candidate's JAR actually contains the aarch64 binary** (the Phase 1.2.1 check prints an `OK` line for it) rather than trusting a remembered version number, and that the libraries the binary needs (the `needs` list of that line) are in the target image (`netty-tcnative`'s `linux-aarch_64-fedora` builds need libraries the Amazon Linux 2023 images do not include (`libssl.so.1.1` up to at least 2.0.66, `libapr-1.so.0` in 2.0.84), while `netty-tcnative-boringssl-static` needs only glibc's libraries); the exact floor varies by library and some intermediate versions are unpublished.
 
 **Direct dependencies (Maven):** e.g. snappy-java confirmed lacking `Linux/aarch64/libsnappyjava.so`:
 ```xml
@@ -106,7 +107,7 @@ configurations.all {
 }
 ```
 
-After the updates, copy the dependencies again and re-run the Phase 1.2.1 scan; a MUST UPGRADE item still without an `ARM aarch64` build that suits the target comes back to this step, or goes under User Decisions Pending when no version has one.
+After the updates, copy the dependencies again and re-run the Phase 1.2.1 check; a MUST UPGRADE item that still has a `FINDING` comes back to this step, or goes under User Decisions Pending when every version has one.
 
 ## 2.3 Architecture Detection Code Updates
 
@@ -153,7 +154,7 @@ A stage that runs GraalVM `native-image` builds an executable for the platform i
 
 Multi-stage — **Maven** (builder produces `target/*.jar`):
 ```dockerfile
-# Builder: $BUILDPLATFORM = run the build natively on the builder's arch (faster; a JAR's bytecode is arch-neutral)
+# Builder: $BUILDPLATFORM = run the build natively on the builder's arch (faster; the same JAR as an arm64 build unless a classifier or profile follows the build host)
 FROM --platform=$BUILDPLATFORM <current-builder-image>:<current-version> AS builder
 WORKDIR /app
 COPY . .
